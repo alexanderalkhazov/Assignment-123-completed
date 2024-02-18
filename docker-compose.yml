@@ -1,0 +1,96 @@
+version: '3.7'
+
+networks:
+  mynetwork:
+    driver: bridge
+
+volumes:
+  mongodb:
+
+services:
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:latest
+    container_name: zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: "2181"
+    networks:
+      - mynetwork
+
+  kafka:
+    image: confluentinc/cp-kafka:latest
+    container_name: kafka
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    depends_on:
+      - zookeeper
+    networks:
+      - mynetwork
+
+  mongodb:
+    image: mongo:latest
+    container_name: mongodb
+    hostname: mongodb
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb:/data/db
+    networks:
+      - mynetwork
+    
+  redis:
+    image: redis:latest
+    container_name: redis
+    ports:
+      - "6379:6379"
+    networks:
+      - mynetwork
+
+  producer:
+    build:
+      context: ./Producer
+      dockerfile: Dockerfile
+    depends_on:
+      - kafka
+    networks:
+      - mynetwork
+    volumes:
+      - ./config.ini:/config.ini
+    ports:
+      - "5001:5001"
+
+  consumer:
+    build:
+      context: ./Consumer
+      dockerfile: Dockerfile
+    depends_on:
+      - kafka
+      - mongodb
+    networks:
+      - mynetwork
+    volumes:
+      - ./config.ini:/config.ini
+    ports:
+      - "5002:5002"
+
+  etl:
+    build:
+      context: ./ETL
+      dockerfile: Dockerfile
+    depends_on:
+      - mongodb
+      - redis
+    networks:
+      - mynetwork
+    volumes:
+      - ./config.ini:/config.ini
+    ports:
+      - "5003:5003"

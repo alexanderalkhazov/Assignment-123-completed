@@ -1,8 +1,6 @@
 ﻿using MongoDB.Driver;
 using StackExchange.Redis;
 using MongoDB.Bson;
-using IniParser;
-using IniParser.Model;
 using System.Globalization;
 
 namespace ETL
@@ -13,78 +11,24 @@ namespace ETL
         {
             string currentDirectory = Directory.GetCurrentDirectory();
             string configFile = Path.Combine(currentDirectory, "..", "config.ini");
-            var parser = new FileIniDataParser();
-            IniData fileContext = parser.ReadFile(configFile);
-
-            string mongoConnectionString = fileContext["MONGO_DB"]["MONGO_CONNECTION_STRING"];
-            string collectionName = fileContext["MONGO_DB"]["COLLECTION_NAME"];
-            string mongoDatabaseName = fileContext["MONGO_DB"]["DATABASE_NAME"];
-
-            string redisHostName = fileContext["REDIS"]["REDIS_HOST_NAME"];
-            string redisPort = fileContext["REDIS"]["REDIS_PORT"];
-            int etlSleepDuration = int.Parse(fileContext["REDIS"]["ETL_SLEEP_DURATION"]);
-
-            string redisServer = $"{redisHostName}:{redisPort}";
-
-            if (
-                string.IsNullOrEmpty(mongoConnectionString) ||
-                string.IsNullOrEmpty(redisServer) ||
-                string.IsNullOrEmpty(mongoDatabaseName) ||
-                string.IsNullOrEmpty(collectionName)
-            )
-            {
-                Console.WriteLine("One or more environment variables are missing.");
-                return;
-            }
+            var etlIniConfigManager = new ETLIniConfigManager(configFile);
 
             Console.WriteLine("ETL proccess is running.");
 
             try
             {
-                var mongoClient = new MongoClient(mongoConnectionString);
-                var mongoDatabase = mongoClient.GetDatabase(mongoDatabaseName);
-                var mongoCollection = mongoDatabase.GetCollection<BsonDocument>(collectionName);
-
-                var redis = ConnectionMultiplexer.Connect(redisServer);
+                var mongoClient = new MongoClient(etlIniConfigManager.MongoConnectionString);
+                var mongoDatabase = mongoClient.GetDatabase(etlIniConfigManager.MongoDatabaseName);
+                var mongoCollection = mongoDatabase.GetCollection<BsonDocument>(etlIniConfigManager.CollectionName);
+                var redis = ConnectionMultiplexer.Connect(etlIniConfigManager.RedisServerString!);
                 var redisDatabase = redis.GetDatabase();
 
                 while (true)
                 {
                     Console.WriteLine("ETL processing...");
-
-                    string? latestTimestamp = GetLatestTimestamp(redisDatabase);
-
-                    if (!string.IsNullOrEmpty(latestTimestamp))
-                    {
-                        Console.WriteLine($"--latest timestamp {latestTimestamp}--");
-                        DateTime latestDateTimeTimestamp = DateTime.Parse(latestTimestamp, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind);
-                        var filter = Builders<BsonDocument>.Filter.Gt("Timestamp", latestDateTimeTimestamp);
-                        var sort = Builders<BsonDocument>.Sort.Ascending("Timestamp");
-                        var newEventObjects = await mongoCollection.Find(filter).Sort(sort).ToListAsync();
-                        foreach (var eventObj in newEventObjects)
-                        {
-                            Console.WriteLine($"new eventObj: {eventObj["Timestamp"]}");
-                            BsonDateTime timestampBson = eventObj["Timestamp"].AsBsonDateTime;
-                            DateTime timestampUtc = timestampBson.ToUniversalTime();
-                            UpdateLatestTimestamp(timestampUtc.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"), redisDatabase);
-                            SaveNewObjectToRedis(redisDatabase, eventObj);
-                        }
-                    }
-                    else
-                    {
-                        Console.WriteLine("No last timestamp.");
-                        var filter = Builders<BsonDocument>.Filter.Empty;
-                        var newObjects = await mongoCollection.Find(filter).ToListAsync();
-                        foreach (var eventObj in newObjects)
-                        {
-                            BsonDateTime timestampBson = eventObj["Timestamp"].AsBsonDateTime;
-                            DateTime timestampUtc = timestampBson.ToUniversalTime();
-                            UpdateLatestTimestamp(timestampUtc.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"), redisDatabase);
-                            SaveNewObjectToRedis(redisDatabase, eventObj);
-                        }
-                    }
+                    await ProccessEventsAsync(mongoCollection, redisDatabase);
                     Console.WriteLine("Cool down...");
-                    Thread.Sleep(etlSleepDuration);
+                    Thread.Sleep(etlIniConfigManager.EtlSleepDuration);
                 }
             }
             catch (Exception ex)
@@ -93,24 +37,72 @@ namespace ETL
             }
         }
 
-        private static void SaveNewObjectToRedis(IDatabase redisDatabase, BsonDocument eventObj)
+        private static async Task ProccessEventsAsync(IMongoCollection<BsonDocument> mongoCollection, IDatabase redisDatabase)
         {
-            string key = $"{eventObj["ReporterId"].AsInt32}:{eventObj["Timestamp"].AsBsonDateTime}";
-            redisDatabase.StringSet(key, eventObj.ToJson());
-            Console.WriteLine($"--Inserted new object into Redis: {key}--");
+            string? latestTimestamp = GetLatestTimestamp(redisDatabase);
+            var filter = GetCorrectFilterDefinition(latestTimestamp);
+            var newEvents = await mongoCollection.Find(filter).ToListAsync();
+            await SaveAllEventsAsync(newEvents, redisDatabase);
         }
 
-        public static string? GetLatestTimestamp(IDatabase database)
+        private static FilterDefinition<BsonDocument> GetCorrectFilterDefinition(string? latestTimestamp) 
+        {
+            if (!string.IsNullOrEmpty(latestTimestamp))
+            {
+                DateTime latestDateTimeTimestamp = DateTime.Parse(latestTimestamp, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind);
+                return Builders<BsonDocument>.Filter.Gt("Timestamp", latestDateTimeTimestamp);
+            } 
+            return Builders<BsonDocument>.Filter.Empty;
+        }
+
+        private static async Task SaveAllEventsAsync(List<BsonDocument>? newEvents, IDatabase redisDatabase)
+        {
+            if (newEvents == null || newEvents.Count == 0)
+            {
+                Console.WriteLine("No new Events!");
+                return;
+            }
+            foreach (var eventEntity in newEvents)
+            {
+                await SaveEventEntityAndUpdateTimestampAsync(eventEntity, redisDatabase);
+            }
+        }
+
+        private static async Task SaveEventEntityAndUpdateTimestampAsync(BsonDocument eventEntity, IDatabase redisDatabase)
+        {
+            Console.WriteLine($"new eventObj: {eventEntity["Timestamp"]}");
+            var timestamp = ConvertToTimestamp(eventEntity);
+            var key = $"{eventEntity["ReporterId"].AsInt32}:{eventEntity["Timestamp"].AsBsonDateTime}";
+
+            var keyValues = new List<KeyValuePair<RedisKey, RedisValue>>
+            {
+                new KeyValuePair<RedisKey, RedisValue>(key, eventEntity.ToJson()),
+                new KeyValuePair<RedisKey, RedisValue>("latest_timestamp", timestamp)
+            };
+
+            var isCommitted = await redisDatabase.StringSetAsync(keyValues.ToArray());
+
+            if (isCommitted)
+            {
+                Console.WriteLine($"Committed successfully. Key: {key}, latest Timestamp: {timestamp}");
+            }
+            else
+            {
+                Console.WriteLine("Commit failed.");
+            }
+        }
+
+        private static string ConvertToTimestamp(BsonDocument eventEntity)
+        {
+            var timestampBson = eventEntity["Timestamp"].AsBsonDateTime;
+            return timestampBson.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ");
+        }
+
+        private static string? GetLatestTimestamp(IDatabase database)
         {
             var latestTimestamp = database.StringGet("latest_timestamp");
             if (string.IsNullOrEmpty(latestTimestamp)) return null;
             return latestTimestamp;
-        }
-
-        public static void UpdateLatestTimestamp(string timestamp, IDatabase database)
-        {
-            database.StringSet("latest_timestamp", timestamp);
-            Console.WriteLine($"---Updated new latest_timestamp: {timestamp}---");
         }
     }
 }

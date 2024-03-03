@@ -41,7 +41,8 @@ namespace ETL
         {
             string? latestTimestamp = GetLatestTimestamp(redisDatabase);
             var filter = GetCorrectFilterDefinition(latestTimestamp);
-            var newEvents = await mongoCollection.Find(filter).ToListAsync();
+            var sort = Builders<BsonDocument>.Sort.Ascending("Timestamp");
+            var newEvents = await mongoCollection.Find(filter).Sort(sort).ToListAsync();
             await SaveAllEventsAsync(newEvents, redisDatabase);
         }
 
